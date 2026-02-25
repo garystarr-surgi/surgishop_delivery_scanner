@@ -1,5 +1,3 @@
-from frappe import __version__ as frappe_version
-
 app_name = "surgishop_delivery_scanner"
 app_title = "SurgiShop Delivery Scanner"
 app_publisher = "SurgiShop"
