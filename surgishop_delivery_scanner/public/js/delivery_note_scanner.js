@@ -2,6 +2,7 @@
  * SurgiShop Delivery Scanner
  * Scan-to-verify workflow for Delivery Notes
  * Does NOT increment quantities - only marks items as verified
+ * CAPTURES: Batch No, Serial No, Expiry Date from scanned barcodes
  */
 
 frappe.provide('surgishop.delivery_scanner');
@@ -53,9 +54,54 @@ frappe.ui.form.on('Delivery Note', {
 
 /**
  * Main verification logic
+ * Uses the SurgiShop scanner API to get full item details including batch
  */
 function verify_item_scan(frm, barcode) {
-    // Find item by barcode
+    // Use the SurgiShop scanner API to get complete scan details
+    frappe.call({
+        method: 'surgishop_erp_scanner.surgishop_erp_scanner.api.barcode.scan_barcode',
+        args: {
+            search_value: barcode,
+            ctx: {
+                company: frm.doc.company,
+                set_warehouse: frm.doc.set_warehouse
+            }
+        },
+        callback: function(r) {
+            if (!r.message || !r.message.item_code) {
+                // Fallback to basic barcode lookup if SurgiShop scanner not available
+                fallback_barcode_lookup(frm, barcode);
+                return;
+            }
+            
+            const scan_data = r.message;
+            
+            // Find matching row in items table
+            const row = find_matching_unverified_row(frm, scan_data);
+            
+            if (!row) {
+                frappe.show_alert({
+                    message: `Item ${scan_data.item_code} not found in delivery or already verified!`,
+                    indicator: 'orange'
+                }, 5);
+                frappe.utils.play_sound('error');
+                return;
+            }
+            
+            // Mark as verified and populate batch/serial data
+            mark_row_verified(frm, row, scan_data);
+        },
+        error: function() {
+            // Fallback if API not available
+            fallback_barcode_lookup(frm, barcode);
+        }
+    });
+}
+
+/**
+ * Fallback barcode lookup if SurgiShop scanner API not available
+ */
+function fallback_barcode_lookup(frm, barcode) {
     frappe.call({
         method: 'erpnext.stock.get_item_details.get_item_code',
         args: {
@@ -71,14 +117,17 @@ function verify_item_scan(frm, barcode) {
                 return;
             }
             
-            const item_code = r.message;
+            const scan_data = {
+                item_code: r.message,
+                barcode: barcode
+            };
             
-            // Find matching row in items table
-            const row = find_unverified_row(frm, item_code);
+            // Find matching row
+            const row = find_matching_unverified_row(frm, scan_data);
             
             if (!row) {
                 frappe.show_alert({
-                    message: `Item ${item_code} not found in delivery or already verified!`,
+                    message: `Item ${scan_data.item_code} not found in delivery or already verified!`,
                     indicator: 'orange'
                 }, 5);
                 frappe.utils.play_sound('error');
@@ -86,19 +135,34 @@ function verify_item_scan(frm, barcode) {
             }
             
             // Mark as verified
-            mark_row_verified(frm, row);
+            mark_row_verified(frm, row, scan_data);
         }
     });
 }
 
 /**
- * Find first unverified row for the given item
+ * Find first unverified row matching the scanned item
+ * Considers batch_no if scanning a GS1 barcode with batch
  */
-function find_unverified_row(frm, item_code) {
+function find_matching_unverified_row(frm, scan_data) {
     const items = frm.doc.items || [];
+    const scanned_item_code = scan_data.item_code;
+    const scanned_batch = scan_data.batch_no || null;
     
+    // First, try to find exact match (item + batch if batch tracking)
+    if (scanned_batch) {
+        for (let item of items) {
+            if (item.item_code === scanned_item_code && 
+                !item.custom_verified &&
+                (!item.batch_no || item.batch_no === scanned_batch)) {
+                return item;
+            }
+        }
+    }
+    
+    // If no batch match or no batch scanned, find any unverified row for this item
     for (let item of items) {
-        if (item.item_code === item_code && !item.custom_verified) {
+        if (item.item_code === scanned_item_code && !item.custom_verified) {
             return item;
         }
     }
@@ -107,21 +171,61 @@ function find_unverified_row(frm, item_code) {
 }
 
 /**
- * Mark a row as verified
+ * Mark a row as verified and populate batch/serial/expiry data from scan
  */
-function mark_row_verified(frm, row) {
-    // Set verified flag
-    frappe.model.set_value(row.doctype, row.name, 'custom_verified', 1);
+function mark_row_verified(frm, row, scan_data) {
+    const updates = {
+        custom_verified: 1
+    };
+    
+    // Populate batch number if scanned
+    if (scan_data.batch_no && frappe.meta.has_field(row.doctype, 'batch_no')) {
+        updates.batch_no = scan_data.batch_no;
+        
+        // Fetch and populate batch expiry date
+        if (frappe.meta.has_field(row.doctype, 'custom_expiration_date')) {
+            frappe.db.get_value('Batch', scan_data.batch_no, 'expiry_date', (r) => {
+                if (r && r.expiry_date) {
+                    frappe.model.set_value(row.doctype, row.name, 'custom_expiration_date', r.expiry_date);
+                }
+            });
+        }
+    }
+    
+    // Populate serial number if scanned
+    if (scan_data.serial_no && frappe.meta.has_field(row.doctype, 'serial_no')) {
+        const existing_serials = row.serial_no || '';
+        updates.serial_no = existing_serials ? 
+            existing_serials + '\n' + scan_data.serial_no : 
+            scan_data.serial_no;
+    }
+    
+    // Populate barcode field if exists
+    if (scan_data.barcode && frappe.meta.has_field(row.doctype, 'barcode')) {
+        updates.barcode = scan_data.barcode;
+    }
+    
+    // Apply all updates
+    frappe.model.set_value(row.doctype, row.name, updates);
     
     // Track this scan
     const scan_key = `${row.item_code}_${row.idx}`;
     surgishop.delivery_scanner.scanned_items[scan_key] = true;
     
+    // Build feedback message
+    let message = `Row ${row.idx}: ${row.item_code} verified ✓`;
+    if (scan_data.batch_no) {
+        message += ` (Batch: ${scan_data.batch_no})`;
+    }
+    if (scan_data.serial_no) {
+        message += ` (S/N: ${scan_data.serial_no})`;
+    }
+    
     // Visual feedback
     frappe.show_alert({
-        message: `Row ${row.idx}: ${row.item_code} verified ✓`,
+        message: message,
         indicator: 'green'
-    }, 3);
+    }, 4);
     frappe.utils.play_sound('submit');
     
     // Refresh the items table to show checkmark
