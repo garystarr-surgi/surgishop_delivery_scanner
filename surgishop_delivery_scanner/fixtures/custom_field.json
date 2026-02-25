@@ -1,1 +1,27 @@
-
+[
+  {
+    "doctype": "Custom Field",
+    "dt": "Delivery Note",
+    "fieldname": "custom_scan_verification_mode",
+    "fieldtype": "Check",
+    "label": "Enable Scan Verification",
+    "insert_after": "scan_barcode",
+    "description": "Enable to verify picks by scanning. Items won't increment quantity.",
+    "default": "1",
+    "allow_on_submit": 0
+  },
+  {
+    "doctype": "Custom Field",
+    "dt": "Delivery Note Item",
+    "fieldname": "custom_verified",
+    "fieldtype": "Check",
+    "label": "✓ Verified",
+    "insert_after": "qty",
+    "in_list_view": 1,
+    "columns": 1,
+    "read_only": 1,
+    "allow_on_submit": 0,
+    "default": "0",
+    "bold": 1
+  }
+]
